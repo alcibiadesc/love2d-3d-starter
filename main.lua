@@ -84,17 +84,19 @@ function camera:rotate(dx, dy)
     if self.pitch < -lim then self.pitch = -lim end
 end
 
+-- Right-handed, +X right, +Y up, -Z forward at yaw=0.
+-- Mouse right (dx > 0) → yaw increases → forward turns toward +X.
 function camera:forwardXZ()
-    return -math.sin(self.yaw), -math.cos(self.yaw)
+    return math.sin(self.yaw), -math.cos(self.yaw)
 end
 
 function camera:rightXZ()
-    return math.cos(self.yaw), -math.sin(self.yaw)
+    return math.cos(self.yaw), math.sin(self.yaw)
 end
 
 function camera:viewProjection(aspect)
     local p  = mat4.perspective(FOV, aspect, NEAR, FAR)
-    local ry = mat4.rotationY(-self.yaw)
+    local ry = mat4.rotationY(self.yaw)
     local rx = mat4.rotationX(-self.pitch)
     local t  = mat4.translation(-self.pos[1], -self.pos[2], -self.pos[3])
     return mat4.mul(p, mat4.mul(rx, mat4.mul(ry, t)))
