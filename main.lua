@@ -160,16 +160,18 @@ local VERTEX_FORMAT = {
 -- Mesh builders
 ------------------------------------------------------------------------------
 
--- Append two CCW triangles for a quad given 4 corners + face normal + color.
+-- Append two triangles for a quad given 4 corners (A, B, C, D walking around
+-- the quad) + face normal + color. Triangles are emitted so the cross product
+-- (C-A) × (B-A) and (D-A) × (C-A) point along +normal — i.e., the visible
+-- side from outside the cube. Backface culling can then stay enabled.
 local function pushQuad(verts, indices, a, b, c, d, n, col)
     local base = #verts
     verts[#verts+1] = {a[1], a[2], a[3], n[1], n[2], n[3], col[1], col[2], col[3]}
     verts[#verts+1] = {b[1], b[2], b[3], n[1], n[2], n[3], col[1], col[2], col[3]}
     verts[#verts+1] = {c[1], c[2], c[3], n[1], n[2], n[3], col[1], col[2], col[3]}
     verts[#verts+1] = {d[1], d[2], d[3], n[1], n[2], n[3], col[1], col[2], col[3]}
-    -- CCW seen from the +normal side.
-    indices[#indices+1] = base+1; indices[#indices+1] = base+2; indices[#indices+1] = base+3
-    indices[#indices+1] = base+1; indices[#indices+1] = base+3; indices[#indices+1] = base+4
+    indices[#indices+1] = base+1; indices[#indices+1] = base+3; indices[#indices+1] = base+2
+    indices[#indices+1] = base+1; indices[#indices+1] = base+4; indices[#indices+1] = base+3
 end
 
 local function pushCube(verts, indices, cx, cy, cz, s, col)
