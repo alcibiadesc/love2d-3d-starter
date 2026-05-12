@@ -1,9 +1,9 @@
 -- Tiny 3D demo in Love2D — one file, no deps.
--- Flat ground plane, WASD to move, mouse to look. That's it.
+-- A flat ground plane with colored cubes you can walk around.
 --
 -- The whole thing is: a hand-rolled row-major mat4, a yaw/pitch camera,
--- and one shader. Love2D's 2D API can render 3D if you set the depth
--- buffer up yourself and ship a viewProjection matrix to a custom shader.
+-- and one shader. Love2D's 2D API renders 3D fine once you attach a depth
+-- buffer to a canvas and ship a viewProjection matrix to a custom shader.
 --
 -- Controls:
 --   WASD           move
@@ -19,13 +19,14 @@
 local FOV        = math.rad(75)
 local NEAR, FAR  = 1, 4000
 local MOUSE_SENS = 0.0025
-local MOVE_SPEED = 200      -- world units / second
+local MOVE_SPEED = 220
 
-local PLANE_HALF = 1000     -- ground extends this far in each direction
-local GRID_CELL  = 50       -- shader grid line every N world units
+local GROUND_HALF = 1200
+local CUBE_SIZE   = 40
+local CUBE_COUNT  = 64
 
 ------------------------------------------------------------------------------
--- mat4 — row-major. Sent to shaders with :send(name, "row", m).
+-- mat4 — row-major. Send to shaders with :send(name, "row", m).
 ------------------------------------------------------------------------------
 local mat4 = {}
 
@@ -67,12 +68,12 @@ function mat4.mul(a, b)
 end
 
 ------------------------------------------------------------------------------
--- Camera. Yaw around Y, pitch around X (clamped to avoid gimbal flip).
+-- Camera. Yaw around Y, pitch around X (clamped to dodge gimbal flip).
 ------------------------------------------------------------------------------
 local camera = {
-    pos   = {0, 60, 200},
+    pos   = {0, 80, 400},
     yaw   = 0,
-    pitch = 0,
+    pitch = -0.15,
 }
 
 function camera:rotate(dx, dy)
@@ -100,55 +101,114 @@ function camera:viewProjection(aspect)
 end
 
 ------------------------------------------------------------------------------
--- Shader. Vertex pass = viewProjection. Fragment paints a grid based on
--- world-space XZ and fades to the sky color with distance fog.
+-- Shader. Vertex pass applies viewProjection; fragment does Lambert + fog.
+-- Normals are baked into the mesh per-vertex (flat: all 4 verts of a face
+-- share the face normal) so the shader stays trivial.
 ------------------------------------------------------------------------------
 local VERT_SRC = [[
+attribute vec3 VertexNormal;
+attribute vec3 VertexColor3;
+
 uniform mat4 uViewProj;
+uniform vec3 uLight;
+
+varying vec3 vColor;
 varying vec3 vWorld;
+varying float vShade;
 
 vec4 position(mat4 _t, vec4 vp) {
-    vWorld = vp.xyz;
+    vec3 n   = normalize(VertexNormal);
+    float l  = max(dot(n, normalize(uLight)), 0.0);
+    vShade   = 0.35 + 0.65 * l;
+    vColor   = VertexColor3;
+    vWorld   = vp.xyz;
     return uViewProj * vp;
 }
 ]]
 
 local FRAG_SRC = [[
+varying vec3 vColor;
 varying vec3 vWorld;
-uniform float uGridCell;
+varying float vShade;
+
+uniform vec3 uSky;
 uniform float uFog;
 
 vec4 effect(vec4 _c, Image _t, vec2 _uv, vec2 _sc) {
-    vec2 g  = abs(fract(vWorld.xz / uGridCell - 0.5) - 0.5) * uGridCell;
-    float d = min(g.x, g.y);
-    float w = fwidth(d) * 1.2;
-    float line = 1.0 - smoothstep(0.0, w, d);
-
-    vec3 floorCol = vec3(0.18, 0.20, 0.24);
-    vec3 lineCol  = vec3(0.55, 0.62, 0.72);
-    vec3 col      = mix(floorCol, lineCol, line);
-
     float fog = clamp(length(vWorld.xz) / uFog, 0.0, 1.0);
-    vec3  sky = vec3(0.55, 0.70, 0.85);
-    return vec4(mix(col, sky, fog), 1.0);
+    vec3  col = vColor * vShade;
+    return vec4(mix(col, uSky, fog), 1.0);
 }
 ]]
 
-------------------------------------------------------------------------------
--- One quad covering the ground plane. Position only — shader does the rest.
-------------------------------------------------------------------------------
-local VERTEX_FORMAT = {{"VertexPosition", "float", 3}}
+-- Vertex layout: position (3) + normal (3) + color (3). Floats.
+local VERTEX_FORMAT = {
+    {"VertexPosition", "float", 3},
+    {"VertexNormal",   "float", 3},
+    {"VertexColor3",   "float", 3},
+}
 
-local function buildPlaneMesh()
-    local h = PLANE_HALF
-    local verts = {
-        {-h, 0, -h},
-        { h, 0, -h},
-        { h, 0,  h},
-        {-h, 0,  h},
-    }
-    -- CCW from above (+Y normal) so backface culling can stay enabled.
-    local indices = {1, 3, 2,  1, 4, 3}
+------------------------------------------------------------------------------
+-- Mesh builders
+------------------------------------------------------------------------------
+
+-- Append two CCW triangles for a quad given 4 corners + face normal + color.
+local function pushQuad(verts, indices, a, b, c, d, n, col)
+    local base = #verts
+    verts[#verts+1] = {a[1], a[2], a[3], n[1], n[2], n[3], col[1], col[2], col[3]}
+    verts[#verts+1] = {b[1], b[2], b[3], n[1], n[2], n[3], col[1], col[2], col[3]}
+    verts[#verts+1] = {c[1], c[2], c[3], n[1], n[2], n[3], col[1], col[2], col[3]}
+    verts[#verts+1] = {d[1], d[2], d[3], n[1], n[2], n[3], col[1], col[2], col[3]}
+    -- CCW seen from the +normal side.
+    indices[#indices+1] = base+1; indices[#indices+1] = base+2; indices[#indices+1] = base+3
+    indices[#indices+1] = base+1; indices[#indices+1] = base+3; indices[#indices+1] = base+4
+end
+
+local function pushCube(verts, indices, cx, cy, cz, s, col)
+    local h = s * 0.5
+    local x0,y0,z0 = cx-h, cy-h, cz-h
+    local x1,y1,z1 = cx+h, cy+h, cz+h
+    -- 6 faces. Quad corner order chosen so CCW points along the named normal.
+    pushQuad(verts, indices, {x0,y1,z1},{x1,y1,z1},{x1,y0,z1},{x0,y0,z1}, { 0, 0, 1}, col)  -- front  (+Z)
+    pushQuad(verts, indices, {x1,y1,z0},{x0,y1,z0},{x0,y0,z0},{x1,y0,z0}, { 0, 0,-1}, col)  -- back   (-Z)
+    pushQuad(verts, indices, {x0,y1,z0},{x0,y1,z1},{x0,y0,z1},{x0,y0,z0}, {-1, 0, 0}, col)  -- left   (-X)
+    pushQuad(verts, indices, {x1,y1,z1},{x1,y1,z0},{x1,y0,z0},{x1,y0,z1}, { 1, 0, 0}, col)  -- right  (+X)
+    pushQuad(verts, indices, {x0,y1,z0},{x1,y1,z0},{x1,y1,z1},{x0,y1,z1}, { 0, 1, 0}, col)  -- top    (+Y)
+    pushQuad(verts, indices, {x0,y0,z1},{x1,y0,z1},{x1,y0,z0},{x0,y0,z0}, { 0,-1, 0}, col)  -- bottom (-Y)
+end
+
+local function buildWorldMesh()
+    local verts, indices = {}, {}
+
+    -- Ground quad. CCW seen from above (+Y).
+    pushQuad(verts, indices,
+        {-GROUND_HALF, 0, -GROUND_HALF},
+        { GROUND_HALF, 0, -GROUND_HALF},
+        { GROUND_HALF, 0,  GROUND_HALF},
+        {-GROUND_HALF, 0,  GROUND_HALF},
+        {0, 1, 0},
+        {0.22, 0.28, 0.32}
+    )
+
+    -- Cubes scattered on a deterministic pseudo-random grid so the demo
+    -- looks the same on every run (no math.randomseed in the hot path).
+    local seed = 1
+    local function rand()
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        return seed / 2147483648
+    end
+    for _ = 1, CUBE_COUNT do
+        local x = (rand() * 2 - 1) * (GROUND_HALF - 100)
+        local z = (rand() * 2 - 1) * (GROUND_HALF - 100)
+        local h = CUBE_SIZE * (0.6 + rand() * 1.8)
+        local col = {
+            0.4 + rand() * 0.55,
+            0.4 + rand() * 0.55,
+            0.4 + rand() * 0.55,
+        }
+        pushCube(verts, indices, x, h * 0.5, z, h, col)
+    end
+
     local mesh = love.graphics.newMesh(VERTEX_FORMAT, verts, "triangles", "static")
     mesh:setVertexMap(indices)
     return mesh
@@ -157,21 +217,23 @@ end
 ------------------------------------------------------------------------------
 -- Love callbacks
 ------------------------------------------------------------------------------
-local plane, shader, canvas
+local world, shader, canvas
+
+local SKY = {0.55, 0.70, 0.85}
 
 local function newCanvas(w, h)
     local c = love.graphics.newCanvas(w, h, { format = "rgba8" })
-    c:setFilter("nearest", "nearest")
+    c:setFilter("linear", "linear")
     return c
 end
 
 function love.load()
     love.window.setTitle("Love2D 3D — single-file demo")
-    love.window.setMode(1280, 720, { resizable = true, vsync = 1 })
+    love.window.setMode(1280, 720, { resizable = true, vsync = true })
     love.mouse.setRelativeMode(true)
 
     shader = love.graphics.newShader(FRAG_SRC, VERT_SRC)
-    plane  = buildPlaneMesh()
+    world  = buildWorldMesh()
     canvas = newCanvas(love.graphics.getDimensions())
 end
 
@@ -212,18 +274,19 @@ function love.draw()
     local aspect = w / h
     local vp     = camera:viewProjection(aspect)
 
-    -- 3D pass: depth test on, render into a canvas with depth attached.
+    -- 3D pass: depth-attached canvas, depth test on, back-face culling on.
     love.graphics.setCanvas({ canvas, depth = true })
-    love.graphics.clear(0.55, 0.70, 0.85, 1, true, true)  -- sky + depth
+    love.graphics.clear(SKY[1], SKY[2], SKY[3], 1, true, true)
     love.graphics.setDepthMode("lequal", true)
     love.graphics.setMeshCullMode("back")
     love.graphics.setShader(shader)
     shader:send("uViewProj", "row", vp)
-    shader:send("uGridCell", GRID_CELL)
-    shader:send("uFog",      PLANE_HALF * 0.9)
-    love.graphics.draw(plane)
+    shader:send("uLight",    {0.4, 1.0, 0.3})
+    shader:send("uSky",      SKY)
+    shader:send("uFog",      GROUND_HALF * 1.4)
+    love.graphics.draw(world)
 
-    -- Reset to 2D.
+    -- Back to 2D for the HUD.
     love.graphics.setShader()
     love.graphics.setDepthMode()
     love.graphics.setMeshCullMode("none")
@@ -232,10 +295,10 @@ function love.draw()
     love.graphics.setColor(1, 1, 1, 1)
     love.graphics.draw(canvas, 0, 0)
 
-    -- HUD.
     love.graphics.print(
         ("FPS %d   pos %.0f, %.0f, %.0f"):format(
-            love.timer.getFPS(), camera.pos[1], camera.pos[2], camera.pos[3]),
+            love.timer.getFPS(),
+            camera.pos[1], camera.pos[2], camera.pos[3]),
         8, 8)
     love.graphics.print("WASD move, mouse look, space/ctrl fly, esc quit", 8, 24)
 end
