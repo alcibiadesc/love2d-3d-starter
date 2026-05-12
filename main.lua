@@ -1,9 +1,10 @@
 -- Tiny 3D demo in Love2D — one file, no deps.
--- A flat ground plane with colored cubes you can walk around.
+-- Flat ground with colored cubes. Walk around, jump, look with the mouse.
 --
 -- The whole thing is: a hand-rolled row-major mat4, a yaw/pitch camera,
--- and one shader. Love2D's 2D API renders 3D fine once you attach a depth
--- buffer to a canvas and ship a viewProjection matrix to a custom shader.
+-- and a tiny shader. Love2D's 2D API renders 3D fine once the main
+-- framebuffer has a depth buffer (asked for in setMode) and you ship a
+-- viewProjection matrix to a custom shader.
 --
 -- Controls:
 --   WASD    move
@@ -20,10 +21,10 @@ local FOV         = math.rad(75)
 local NEAR, FAR   = 1, 4000
 local MOUSE_SENS  = 0.0025
 local MOVE_SPEED  = 220
-local EYE_HEIGHT  = 64       -- camera Y when grounded
-local GRAVITY     = 1400     -- world units / s² pulling player down
-local JUMP_SPEED  = 480      -- initial upward velocity on space
-local PLAYER_R    = 18       -- cylinder radius for cube collision
+local EYE_HEIGHT  = 64
+local GRAVITY     = 1400
+local JUMP_SPEED  = 480
+local PLAYER_R    = 18
 
 local GROUND_HALF = 1200
 local CUBE_SIZE   = 40
@@ -33,31 +34,6 @@ local CUBE_COUNT  = 64
 -- mat4 — row-major. Send to shaders with :send(name, "row", m).
 ------------------------------------------------------------------------------
 local mat4 = {}
-
-function mat4.translation(x, y, z)
-    return {{1,0,0,x},{0,1,0,y},{0,0,1,z},{0,0,0,1}}
-end
-
-function mat4.rotationX(a)
-    local c, s = math.cos(a), math.sin(a)
-    return {{1,0,0,0},{0,c,-s,0},{0,s,c,0},{0,0,0,1}}
-end
-
-function mat4.rotationY(a)
-    local c, s = math.cos(a), math.sin(a)
-    return {{c,0,s,0},{0,1,0,0},{-s,0,c,0},{0,0,0,1}}
-end
-
-function mat4.perspective(fovY, aspect, near, far)
-    local f  = 1 / math.tan(fovY * 0.5)
-    local nf = 1 / (near - far)
-    return {
-        {f/aspect, 0, 0,             0},
-        {0,        f, 0,             0},
-        {0,        0, (far+near)*nf, (2*far*near)*nf},
-        {0,        0, -1,            0},
-    }
-end
 
 function mat4.mul(a, b)
     local r = {{0,0,0,0},{0,0,0,0},{0,0,0,0},{0,0,0,0}}
@@ -71,14 +47,30 @@ function mat4.mul(a, b)
     return r
 end
 
+-- Standard GL perspective. Right-handed: camera looks down -Z in view space.
+-- Note the -1 in the bottom row: it makes the perspective divide use -z_view
+-- as w, so points in front (z_view < 0) end up with positive w.
+function mat4.perspective(fovY, aspect, near, far)
+    local f  = 1 / math.tan(fovY * 0.5)
+    local nf = 1 / (near - far)
+    return {
+        {f/aspect, 0, 0,             0},
+        {0,        f, 0,             0},
+        {0,        0, (far+near)*nf, (2*far*near)*nf},
+        {0,        0, -1,            0},
+    }
+end
+
 ------------------------------------------------------------------------------
--- Camera. Yaw around Y, pitch around X (clamped to dodge gimbal flip).
+-- Camera. yaw rotates around +Y; pitch rotates around the camera's right
+-- axis. Conventions chosen so mouse-right turns the view right (forward
+-- moves toward +X) and mouse-up tilts the view up.
 ------------------------------------------------------------------------------
 local camera = {
-    pos    = {0, EYE_HEIGHT, 400},
-    yaw    = 0,
-    pitch  = 0,
-    velY   = 0,        -- vertical velocity (for jump/gravity)
+    pos      = {0, EYE_HEIGHT, 400},
+    yaw      = 0,
+    pitch    = 0,
+    velY     = 0,
     onGround = true,
 }
 
@@ -90,28 +82,50 @@ function camera:rotate(dx, dy)
     if self.pitch < -lim then self.pitch = -lim end
 end
 
--- Right-handed, +X right, +Y up, -Z forward at yaw=0.
--- Mouse right (dx > 0) → yaw increases → forward turns toward +X.
+-- Forward vector projected onto the XZ plane (used for WASD).
+-- At yaw=0 returns (0, -1) so W moves toward -Z.
 function camera:forwardXZ()
     return math.sin(self.yaw), -math.cos(self.yaw)
 end
 
+-- Right vector projected onto XZ (used for strafe).
+-- At yaw=0 returns (1, 0) so D moves toward +X.
 function camera:rightXZ()
     return math.cos(self.yaw), math.sin(self.yaw)
 end
 
+-- Build the view-projection by composing an explicit world-space camera
+-- basis (right / up / forward) into a look-at view matrix, then the
+-- perspective. The explicit basis makes orientation impossible to mis-sign.
 function camera:viewProjection(aspect)
-    local p  = mat4.perspective(FOV, aspect, NEAR, FAR)
-    local ry = mat4.rotationY(self.yaw)
-    local rx = mat4.rotationX(-self.pitch)
-    local t  = mat4.translation(-self.pos[1], -self.pos[2], -self.pos[3])
-    return mat4.mul(p, mat4.mul(rx, mat4.mul(ry, t)))
+    local cy, sy = math.cos(self.yaw),   math.sin(self.yaw)
+    local cp, sp = math.cos(self.pitch), math.sin(self.pitch)
+
+    -- World-space camera basis. Forward at yaw=0 pitch=0 is -Z.
+    local fx, fy, fz = sy*cp, sp, -cy*cp
+    local rx, ry, rz = cy,    0,  sy
+    -- up = right × forward (verified: at yaw=0 pitch=0 yields +Y).
+    local ux = ry*fz - rz*fy
+    local uy = rz*fx - rx*fz
+    local uz = rx*fy - ry*fx
+
+    local px, py, pz = self.pos[1], self.pos[2], self.pos[3]
+
+    -- View matrix: rows are right, up, -forward; translate by -pos.
+    -- (Each row dotted with a world point gives that point's view-space coord.)
+    local view = {
+        { rx,  ry,  rz, -(rx*px + ry*py + rz*pz)},
+        { ux,  uy,  uz, -(ux*px + uy*py + uz*pz)},
+        {-fx, -fy, -fz, -(-fx*px + -fy*py + -fz*pz)},
+        {  0,   0,   0,  1},
+    }
+
+    return mat4.mul(mat4.perspective(FOV, aspect, NEAR, FAR), view)
 end
 
 ------------------------------------------------------------------------------
--- Shader. Vertex pass applies viewProjection; fragment does Lambert + fog.
--- Normals are baked into the mesh per-vertex (flat: all 4 verts of a face
--- share the face normal) so the shader stays trivial.
+-- Shader. Vertex pass applies viewProjection; fragment does cheap Lambert
+-- against a single directional light plus distance fog.
 ------------------------------------------------------------------------------
 local VERT_SRC = [[
 attribute vec3 VertexNormal;
@@ -149,7 +163,6 @@ vec4 effect(vec4 _c, Image _t, vec2 _uv, vec2 _sc) {
 }
 ]]
 
--- Vertex layout: position (3) + normal (3) + color (3). Floats.
 local VERTEX_FORMAT = {
     {"VertexPosition", "float", 3},
     {"VertexNormal",   "float", 3},
@@ -157,44 +170,42 @@ local VERTEX_FORMAT = {
 }
 
 ------------------------------------------------------------------------------
--- Mesh builders
+-- Mesh builders. The quad helper emits two triangles wound so the visible
+-- side from +normal direction faces the camera (CCW in screen space) — this
+-- lets backface culling stay enabled.
 ------------------------------------------------------------------------------
-
--- Append two triangles for a quad given 4 corners (A, B, C, D walking around
--- the quad) + face normal + color. Triangles are emitted so the cross product
--- (C-A) × (B-A) and (D-A) × (C-A) point along +normal — i.e., the visible
--- side from outside the cube. Backface culling can then stay enabled.
 local function pushQuad(verts, indices, a, b, c, d, n, col)
     local base = #verts
     verts[#verts+1] = {a[1], a[2], a[3], n[1], n[2], n[3], col[1], col[2], col[3]}
     verts[#verts+1] = {b[1], b[2], b[3], n[1], n[2], n[3], col[1], col[2], col[3]}
     verts[#verts+1] = {c[1], c[2], c[3], n[1], n[2], n[3], col[1], col[2], col[3]}
     verts[#verts+1] = {d[1], d[2], d[3], n[1], n[2], n[3], col[1], col[2], col[3]}
+    -- Triangles (A, C, B) and (A, D, C). Pen-and-paper check: for the +Z face
+    -- A=(x0,y1,z1), B=(x1,y1,z1), C=(x1,y0,z1), D=(x0,y0,z1), the cross
+    -- (C-A) × (B-A) = (0, 0, +h²) — points along +Z, the outward normal.
     indices[#indices+1] = base+1; indices[#indices+1] = base+3; indices[#indices+1] = base+2
     indices[#indices+1] = base+1; indices[#indices+1] = base+4; indices[#indices+1] = base+3
 end
 
 local function pushCube(verts, indices, cx, cy, cz, s, col)
     local h = s * 0.5
-    local x0,y0,z0 = cx-h, cy-h, cz-h
-    local x1,y1,z1 = cx+h, cy+h, cz+h
-    -- 6 faces. Quad corner order chosen so CCW points along the named normal.
-    pushQuad(verts, indices, {x0,y1,z1},{x1,y1,z1},{x1,y0,z1},{x0,y0,z1}, { 0, 0, 1}, col)  -- front  (+Z)
-    pushQuad(verts, indices, {x1,y1,z0},{x0,y1,z0},{x0,y0,z0},{x1,y0,z0}, { 0, 0,-1}, col)  -- back   (-Z)
-    pushQuad(verts, indices, {x0,y1,z0},{x0,y1,z1},{x0,y0,z1},{x0,y0,z0}, {-1, 0, 0}, col)  -- left   (-X)
-    pushQuad(verts, indices, {x1,y1,z1},{x1,y1,z0},{x1,y0,z0},{x1,y0,z1}, { 1, 0, 0}, col)  -- right  (+X)
-    pushQuad(verts, indices, {x0,y1,z0},{x1,y1,z0},{x1,y1,z1},{x0,y1,z1}, { 0, 1, 0}, col)  -- top    (+Y)
-    pushQuad(verts, indices, {x0,y0,z1},{x1,y0,z1},{x1,y0,z0},{x0,y0,z0}, { 0,-1, 0}, col)  -- bottom (-Y)
+    local x0, y0, z0 = cx-h, cy-h, cz-h
+    local x1, y1, z1 = cx+h, cy+h, cz+h
+    pushQuad(verts, indices, {x0,y1,z1},{x1,y1,z1},{x1,y0,z1},{x0,y0,z1}, { 0, 0, 1}, col)  -- +Z
+    pushQuad(verts, indices, {x1,y1,z0},{x0,y1,z0},{x0,y0,z0},{x1,y0,z0}, { 0, 0,-1}, col)  -- -Z
+    pushQuad(verts, indices, {x0,y1,z0},{x0,y1,z1},{x0,y0,z1},{x0,y0,z0}, {-1, 0, 0}, col)  -- -X
+    pushQuad(verts, indices, {x1,y1,z1},{x1,y1,z0},{x1,y0,z0},{x1,y0,z1}, { 1, 0, 0}, col)  -- +X
+    pushQuad(verts, indices, {x0,y1,z0},{x1,y1,z0},{x1,y1,z1},{x0,y1,z1}, { 0, 1, 0}, col)  -- +Y
+    pushQuad(verts, indices, {x0,y0,z1},{x1,y0,z1},{x1,y0,z0},{x0,y0,z0}, { 0,-1, 0}, col)  -- -Y
 end
 
--- Module-level list of cubes used by both the mesh builder and the
--- per-frame collision check. Each entry is {x, z, halfSize, top}.
+-- Module-level list of cubes for per-frame AABB collision (XZ rect + top Y).
 local cubes = {}
 
 local function buildWorldMesh()
     local verts, indices = {}, {}
 
-    -- Ground quad. CCW seen from above (+Y).
+    -- Ground quad — CCW from above (+Y normal).
     pushQuad(verts, indices,
         {-GROUND_HALF, 0, -GROUND_HALF},
         { GROUND_HALF, 0, -GROUND_HALF},
@@ -204,8 +215,8 @@ local function buildWorldMesh()
         {0.22, 0.28, 0.32}
     )
 
-    -- Deterministic pseudo-random scatter so the layout is stable across
-    -- runs (no math.randomseed touching the global RNG state).
+    -- Deterministic pseudo-random scatter (so the layout matches every run
+    -- without touching math.randomseed and disturbing the global RNG).
     local seed = 1
     local function rand()
         seed = (seed * 1103515245 + 12345) % 2147483648
@@ -221,7 +232,7 @@ local function buildWorldMesh()
             0.4 + rand() * 0.55,
         }
         pushCube(verts, indices, x, h * 0.5, z, h, col)
-        cubes[#cubes + 1] = { x = x, z = z, half = h * 0.5, top = h }
+        cubes[#cubes+1] = { x = x, z = z, half = h * 0.5, top = h }
     end
 
     local mesh = love.graphics.newMesh(VERTEX_FORMAT, verts, "triangles", "static")
@@ -229,8 +240,12 @@ local function buildWorldMesh()
     return mesh
 end
 
--- Axis-separated AABB push-out: try the X move alone, then the Z move alone,
--- so the player slides along walls instead of getting stuck on a corner.
+------------------------------------------------------------------------------
+-- Collision. Axis-separated AABB push-out: try X first, then Z. The player
+-- is modeled as a cylinder (PLAYER_R radius) and only blocks against cubes
+-- whose top edge is above the player's feet — so a short cube the player
+-- has jumped above is walked over freely.
+------------------------------------------------------------------------------
 local function blockedAt(x, z, eyeY)
     local footY = eyeY - EYE_HEIGHT
     for _, c in ipairs(cubes) do
@@ -238,10 +253,6 @@ local function blockedAt(x, z, eyeY)
         local dz = z - c.z
         local pad = c.half + PLAYER_R
         if dx > -pad and dx < pad and dz > -pad and dz < pad then
-            -- XZ overlaps. Only block if the body actually straddles the cube
-            -- vertically — eye below cube top AND foot below cube top means
-            -- we'd intersect the box. If feet are above the cube's top, the
-            -- player is on/over it and can pass freely.
             if footY < c.top - 0.01 then return true end
         end
     end
@@ -251,39 +262,31 @@ end
 ------------------------------------------------------------------------------
 -- Love callbacks
 ------------------------------------------------------------------------------
-local world, shader, canvas
+local world, shader
 
 local SKY = {0.55, 0.70, 0.85}
 
-local function newCanvas(w, h)
-    local c = love.graphics.newCanvas(w, h, { format = "rgba8" })
-    c:setFilter("linear", "linear")
-    return c
-end
-
 function love.load()
     love.window.setTitle("Love2D 3D — single-file demo")
-    love.window.setMode(1280, 720, { resizable = true, vsync = true })
+    -- Ask Love2D for a 16-bit depth buffer on the main framebuffer so we
+    -- can z-test directly against the screen — no intermediate canvas, no
+    -- canvas-Y-flip subtleties to worry about.
+    love.window.setMode(1280, 720, { resizable = true, vsync = true, depth = 16 })
     love.mouse.setRelativeMode(true)
 
     shader = love.graphics.newShader(FRAG_SRC, VERT_SRC)
     world  = buildWorldMesh()
-    canvas = newCanvas(love.graphics.getDimensions())
-end
-
-function love.resize(w, h)
-    canvas = newCanvas(w, h)
 end
 
 function love.mousemoved(_, _, dx, dy)
-    -- Raw deltas — do NOT multiply by dt, they're already time-independent.
+    -- Raw deltas — never multiply by dt; they're already time-independent.
     camera:rotate(dx, dy)
 end
 
 function love.keypressed(key)
     if key == "escape" then love.event.quit(0) end
     if key == "space" and camera.onGround then
-        camera.velY    = JUMP_SPEED
+        camera.velY     = JUMP_SPEED
         camera.onGround = false
     end
 end
@@ -301,16 +304,13 @@ function love.update(dt)
     local len = math.sqrt(vx*vx + vz*vz)
     if len > 0 then vx, vz = vx / len, vz / len end
 
-    -- Horizontal move, axis-separated for wall sliding.
-    local dx = vx * MOVE_SPEED * dt
-    local dz = vz * MOVE_SPEED * dt
-    local nx = camera.pos[1] + dx
-    local nz = camera.pos[3] + dz
+    -- Axis-separated horizontal move so the player slides along walls.
+    local nx = camera.pos[1] + vx * MOVE_SPEED * dt
+    local nz = camera.pos[3] + vz * MOVE_SPEED * dt
     if not blockedAt(nx, camera.pos[3], camera.pos[2]) then camera.pos[1] = nx end
     if not blockedAt(camera.pos[1], nz, camera.pos[2]) then camera.pos[3] = nz end
 
-    -- Gravity / jump arc. Ground at Y = EYE_HEIGHT (camera's eye sits at
-    -- that height when feet touch the plane).
+    -- Vertical: simple gravity + ground clamp at eye-height.
     camera.velY  = camera.velY - GRAVITY * dt
     camera.pos[2] = camera.pos[2] + camera.velY * dt
     if camera.pos[2] <= EYE_HEIGHT then
@@ -325,8 +325,7 @@ function love.draw()
     local aspect = w / h
     local vp     = camera:viewProjection(aspect)
 
-    -- 3D pass: depth-attached canvas, depth test on, back-face culling on.
-    love.graphics.setCanvas({ canvas, depth = true })
+    -- 3D pass — depth test + back-face culling on the main framebuffer.
     love.graphics.clear(SKY[1], SKY[2], SKY[3], 1, true, true)
     love.graphics.setDepthMode("lequal", true)
     love.graphics.setMeshCullMode("back")
@@ -337,15 +336,12 @@ function love.draw()
     shader:send("uFog",      GROUND_HALF * 1.4)
     love.graphics.draw(world)
 
-    -- Back to 2D for the HUD.
+    -- Reset to 2D for the HUD.
     love.graphics.setShader()
     love.graphics.setDepthMode()
     love.graphics.setMeshCullMode("none")
-    love.graphics.setCanvas()
 
     love.graphics.setColor(1, 1, 1, 1)
-    love.graphics.draw(canvas, 0, 0)
-
     love.graphics.print(
         ("FPS %d   pos %.0f, %.0f, %.0f"):format(
             love.timer.getFPS(),
