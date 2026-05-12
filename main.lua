@@ -6,20 +6,24 @@
 -- buffer to a canvas and ship a viewProjection matrix to a custom shader.
 --
 -- Controls:
---   WASD           move
---   Mouse          look
---   Space / LCtrl  fly up / down
---   Esc            quit
+--   WASD    move
+--   Mouse   look
+--   Space   jump
+--   Esc     quit
 --
 -- Run with `love .` (Love2D 11.x).
 
 ------------------------------------------------------------------------------
 -- Tunables
 ------------------------------------------------------------------------------
-local FOV        = math.rad(75)
-local NEAR, FAR  = 1, 4000
-local MOUSE_SENS = 0.0025
-local MOVE_SPEED = 220
+local FOV         = math.rad(75)
+local NEAR, FAR   = 1, 4000
+local MOUSE_SENS  = 0.0025
+local MOVE_SPEED  = 220
+local EYE_HEIGHT  = 64       -- camera Y when grounded
+local GRAVITY     = 1400     -- world units / s² pulling player down
+local JUMP_SPEED  = 480      -- initial upward velocity on space
+local PLAYER_R    = 18       -- cylinder radius for cube collision
 
 local GROUND_HALF = 1200
 local CUBE_SIZE   = 40
@@ -71,9 +75,11 @@ end
 -- Camera. Yaw around Y, pitch around X (clamped to dodge gimbal flip).
 ------------------------------------------------------------------------------
 local camera = {
-    pos   = {0, 80, 400},
-    yaw   = 0,
-    pitch = -0.15,
+    pos    = {0, EYE_HEIGHT, 400},
+    yaw    = 0,
+    pitch  = 0,
+    velY   = 0,        -- vertical velocity (for jump/gravity)
+    onGround = true,
 }
 
 function camera:rotate(dx, dy)
@@ -179,6 +185,10 @@ local function pushCube(verts, indices, cx, cy, cz, s, col)
     pushQuad(verts, indices, {x0,y0,z1},{x1,y0,z1},{x1,y0,z0},{x0,y0,z0}, { 0,-1, 0}, col)  -- bottom (-Y)
 end
 
+-- Module-level list of cubes used by both the mesh builder and the
+-- per-frame collision check. Each entry is {x, z, halfSize, top}.
+local cubes = {}
+
 local function buildWorldMesh()
     local verts, indices = {}, {}
 
@@ -192,8 +202,8 @@ local function buildWorldMesh()
         {0.22, 0.28, 0.32}
     )
 
-    -- Cubes scattered on a deterministic pseudo-random grid so the demo
-    -- looks the same on every run (no math.randomseed in the hot path).
+    -- Deterministic pseudo-random scatter so the layout is stable across
+    -- runs (no math.randomseed touching the global RNG state).
     local seed = 1
     local function rand()
         seed = (seed * 1103515245 + 12345) % 2147483648
@@ -209,11 +219,31 @@ local function buildWorldMesh()
             0.4 + rand() * 0.55,
         }
         pushCube(verts, indices, x, h * 0.5, z, h, col)
+        cubes[#cubes + 1] = { x = x, z = z, half = h * 0.5, top = h }
     end
 
     local mesh = love.graphics.newMesh(VERTEX_FORMAT, verts, "triangles", "static")
     mesh:setVertexMap(indices)
     return mesh
+end
+
+-- Axis-separated AABB push-out: try the X move alone, then the Z move alone,
+-- so the player slides along walls instead of getting stuck on a corner.
+local function blockedAt(x, z, eyeY)
+    local footY = eyeY - EYE_HEIGHT
+    for _, c in ipairs(cubes) do
+        local dx = x - c.x
+        local dz = z - c.z
+        local pad = c.half + PLAYER_R
+        if dx > -pad and dx < pad and dz > -pad and dz < pad then
+            -- XZ overlaps. Only block if the body actually straddles the cube
+            -- vertically — eye below cube top AND foot below cube top means
+            -- we'd intersect the box. If feet are above the cube's top, the
+            -- player is on/over it and can pass freely.
+            if footY < c.top - 0.01 then return true end
+        end
+    end
+    return false
 end
 
 ------------------------------------------------------------------------------
@@ -250,6 +280,10 @@ end
 
 function love.keypressed(key)
     if key == "escape" then love.event.quit(0) end
+    if key == "space" and camera.onGround then
+        camera.velY    = JUMP_SPEED
+        camera.onGround = false
+    end
 end
 
 function love.update(dt)
@@ -259,16 +293,29 @@ function love.update(dt)
     local kb = love.keyboard
     local forward = (kb.isDown("w") and 1 or 0) - (kb.isDown("s") and 1 or 0)
     local side    = (kb.isDown("d") and 1 or 0) - (kb.isDown("a") and 1 or 0)
-    local up      = (kb.isDown("space") and 1 or 0) - (kb.isDown("lctrl","lshift") and 1 or 0)
 
     local vx = fx * forward + rx * side
     local vz = fz * forward + rz * side
     local len = math.sqrt(vx*vx + vz*vz)
     if len > 0 then vx, vz = vx / len, vz / len end
 
-    camera.pos[1] = camera.pos[1] + vx * MOVE_SPEED * dt
-    camera.pos[3] = camera.pos[3] + vz * MOVE_SPEED * dt
-    camera.pos[2] = camera.pos[2] + up * MOVE_SPEED * dt
+    -- Horizontal move, axis-separated for wall sliding.
+    local dx = vx * MOVE_SPEED * dt
+    local dz = vz * MOVE_SPEED * dt
+    local nx = camera.pos[1] + dx
+    local nz = camera.pos[3] + dz
+    if not blockedAt(nx, camera.pos[3], camera.pos[2]) then camera.pos[1] = nx end
+    if not blockedAt(camera.pos[1], nz, camera.pos[2]) then camera.pos[3] = nz end
+
+    -- Gravity / jump arc. Ground at Y = EYE_HEIGHT (camera's eye sits at
+    -- that height when feet touch the plane).
+    camera.velY  = camera.velY - GRAVITY * dt
+    camera.pos[2] = camera.pos[2] + camera.velY * dt
+    if camera.pos[2] <= EYE_HEIGHT then
+        camera.pos[2]   = EYE_HEIGHT
+        camera.velY     = 0
+        camera.onGround = true
+    end
 end
 
 function love.draw()
@@ -302,5 +349,5 @@ function love.draw()
             love.timer.getFPS(),
             camera.pos[1], camera.pos[2], camera.pos[3]),
         8, 8)
-    love.graphics.print("WASD move, mouse look, space/ctrl fly, esc quit", 8, 24)
+    love.graphics.print("WASD move, mouse look, space jump, esc quit", 8, 24)
 end
